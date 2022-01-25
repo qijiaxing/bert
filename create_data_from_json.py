@@ -24,12 +24,35 @@ import random
 import tokenization
 import tensorflow as tf
 import json
+import time
+import multiprocessing
 
 # JQ: Sentence splitter for Chinese
 import re
 def zng(para):
     for sent in re.findall(u'[^!?。\!\?\n]+[!?。\!\?]?[”’" 」 ）]*', para, flags=re.U):
         yield sent
+
+# JQ: encoder for parallel processing
+class Encoder(object):
+    def __init__(self, all_documents, max_seq_length, short_seq_prob,
+              masked_lm_prob, max_predictions_per_seq,
+              vocab_words, rng):
+      self.all_documents = all_documents
+      self.max_seq_length = max_seq_length
+      self.short_seq_prob = short_seq_prob
+      self.masked_lm_prob = masked_lm_prob
+      self.max_predictions_per_seq = max_predictions_per_seq
+      self.vocab_words = vocab_words
+      self.rng = rng
+
+    def initializer(self):
+      self.splitter = zng
+
+    def encode(self, document_index):
+      return create_instances_from_document(
+        self.all_documents, document_index, self.max_seq_length, self.short_seq_prob,
+        self.masked_lm_prob, self.max_predictions_per_seq, self.vocab_words, self.rng)
 
 
 flags = tf.flags
@@ -73,6 +96,8 @@ flags.DEFINE_float(
     "Probability of creating sequences which are shorter than the "
     "maximum length.")
 
+flags.DEFINE_integer("workers", 8, "Number of workers for parallel processing.")
+
 
 class TrainingInstance(object):
   """A single training instance (sentence pair)."""
@@ -107,7 +132,7 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length,
   """Create TF example files from `TrainingInstance`s."""
   writers = []
   for output_file in output_files:
-    writers.append(tf.python_io.TFRecordWriter(output_file))
+    writers.append(tf.io.TFRecordWriter(output_file))
 
   writer_index = 0
 
@@ -197,6 +222,7 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
   # sentence boundaries for the "next sentence prediction" task).
   # (2) Blank lines between documents. Document boundaries are needed so
   # that the "next sentence prediction" task doesn't span between documents.
+  tf.compat.v1.logging.info("Start to read input files")
   for input_file in input_files:
     # JQ: Process wiki zh json version file
     # Each line is a json object, with structure: {..., "text": "sdfsdf" }
@@ -210,34 +236,19 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
         all_documents.append([])
       for sentence in zng(text):
        #print("Sent: " + sentence)  # debug
-        tokens = tokenizer.tokenize(line)
+        tokens = tokenizer.tokenize(sentence)
         if tokens:
           all_documents[-1].append(tokens)
       processed += 1
+    tf.compat.v1.logging.info("File: {}, done!".format(input_file))
 
      #if processed == 1: exit() # debug
-
-    """
-    with tf.io.gfile.GFile(input_file, "r") as reader:
-      while True:
-        line = tokenization.convert_to_unicode(reader.readline())
-        if not line:
-          break
-        line = line.strip()
-
-        # Empty lines are used as document delimiters
-        if not line:
-          all_documents.append([])
-        tokens = tokenizer.tokenize(line)
-        if tokens:
-          all_documents[-1].append(tokens)
-    """
-
   # Remove empty documents
   all_documents = [x for x in all_documents if x]
   rng.shuffle(all_documents)
 
   vocab_words = list(tokenizer.vocab.keys())
+  """
   instances = []
   for _ in range(dupe_factor):
     for document_index in range(len(all_documents)):
@@ -245,6 +256,18 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
           create_instances_from_document(
               all_documents, document_index, max_seq_length, short_seq_prob,
               masked_lm_prob, max_predictions_per_seq, vocab_words, rng))
+  """
+
+  # JQ: parallel processing
+  instances = []
+  encoder = Encoder(
+     all_documents, max_seq_length, short_seq_prob,
+     masked_lm_prob, max_predictions_per_seq, vocab_words, rng)
+  pool = multiprocessing.Pool(FLAGS.workers, initializer=encoder.initializer)
+  for _ in range(dupe_factor):
+    res = pool.map(encoder.encode, range(len(all_documents)), 25)
+    for rr in res:
+      instances.extend(rr)
 
   rng.shuffle(instances)
   return instances
@@ -348,9 +371,11 @@ def create_instances_from_document(
         tokens.append("[SEP]")
         segment_ids.append(1)
 
+        # MLM
         (tokens, masked_lm_positions,
          masked_lm_labels) = create_masked_lm_predictions(
              tokens, masked_lm_prob, max_predictions_per_seq, vocab_words, rng)
+
         instance = TrainingInstance(
             tokens=tokens,
             segment_ids=segment_ids,
@@ -465,9 +490,13 @@ def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
 
 def main(_):
   tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
+  logger = tf.get_logger()
+  logger.propagate = False
 
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+
+  t_start = time.time()
 
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
@@ -490,6 +519,9 @@ def main(_):
 
   write_instance_to_example_files(instances, tokenizer, FLAGS.max_seq_length,
                                   FLAGS.max_predictions_per_seq, output_files)
+
+  t_end = time.time()
+  tf.compat.v1.logging.info("Processing took {:.1f} s".format(t_end-t_start))
 
 
 if __name__ == "__main__":
